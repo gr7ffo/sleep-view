@@ -188,7 +188,7 @@ function App() {
               {model.stats.totalSessions}
             </p>
           </article>
-        </div>
+        </section>
       )}
     </main>
   )

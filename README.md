@@ -32,3 +32,7 @@ npm run build
 ```
 
 The Vite `base` is configured for GitHub Pages deployment at `/sleep-view/` in production builds.
+
+## GitHub Pages
+
+The repository includes `.github/workflows/deploy-pages.yml` to build and deploy `dist/` to GitHub Pages on pushes to `main`.
