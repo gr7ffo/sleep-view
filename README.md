@@ -1,32 +1,34 @@
-# React + TypeScript + Vite
+# sleep-view
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+A privacy-first, fully client-side sleep-data visualizer for GitHub Pages.
 
-Currently, two official plugins are available:
+## What it does
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- Accepts `.zip` / `.oscar` archives in the browser.
+- Detects and parses practical OSCAR-compatible formats:
+  - OSCAR profile backup bundles containing SQL payloads (`manifest.json` + `database/**/*.sql`)
+  - Generic SQL-only bundles with OSCAR-style `INSERT INTO ... VALUES ...` statements
+  - CSV-based ZIP exports (fallback parser)
+- Translates parsed records into a normalized in-memory model for trends and metrics.
+- Renders interactive charts (nightly trends, event distribution, machine mix).
 
-## React Compiler
+## Privacy model
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- No backend, no auth, no database, no uploads.
+- Data is parsed in memory in your browser session only.
+- Suitable for static hosting on GitHub Pages.
 
-## Expanding the Oxlint configuration
+## Development
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm install
+npm run dev
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+## Build
+
+```bash
+npm run build
+```
+
+The Vite `base` is configured for GitHub Pages deployment at `/sleep-view/` in production builds.
