@@ -1,0 +1,123 @@
+.app-shell {
+  margin: 0 auto;
+  max-width: 1160px;
+  padding: 2.5rem 1.25rem 3rem;
+  color: #e2e8f0;
+}
+
+.hero-panel {
+  background: linear-gradient(145deg, #111827, #18253f);
+  border: 1px solid #25324b;
+  border-radius: 16px;
+  padding: 1.5rem;
+  box-shadow: 0 16px 45px rgb(7 10 18 / 35%);
+}
+
+.eyebrow {
+  color: #93c5fd;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.75rem;
+  margin: 0;
+}
+
+.hero-panel h1 {
+  margin: 0.5rem 0;
+  font-size: clamp(1.6rem, 3vw, 2.2rem);
+}
+
+.hero-copy {
+  margin: 0 0 1rem;
+  color: #cbd5e1;
+}
+
+.upload-panel {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.8rem;
+  padding: 1rem;
+  border: 1px dashed #334155;
+  border-radius: 12px;
+  background: rgb(9 14 25 / 60%);
+}
+
+.upload-panel input {
+  width: 100%;
+}
+
+.upload-panel small {
+  color: #94a3b8;
+}
+
+.state,
+.error {
+  margin: 0.8rem 0 0;
+  font-size: 0.95rem;
+}
+
+.error {
+  color: #fda4af;
+}
+
+.dashboard {
+  margin-top: 1.2rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.cards {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
+.card,
+.panel {
+  border-radius: 14px;
+  border: 1px solid #2c3a57;
+  background: #151d2f;
+}
+
+.card {
+  padding: 1rem;
+}
+
+.card h2 {
+  margin: 0;
+  font-size: 1.6rem;
+  color: #bfdbfe;
+}
+
+.card p {
+  margin: 0.25rem 0 0;
+  color: #a9b8d9;
+}
+
+.chart-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+}
+
+.panel {
+  padding: 1rem;
+}
+
+.panel h3 {
+  margin: 0 0 0.75rem;
+}
+
+.empty {
+  color: #94a3b8;
+}
+
+.warnings ul {
+  margin: 0;
+  padding-left: 1.1rem;
+  color: #fcd34d;
+}
+
+.privacy-note p {
+  margin: 0.45rem 0;
+  color: #cbd5e1;
+}
