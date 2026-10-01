@@ -24,7 +24,7 @@ export interface SessionMetric {
 }
 
 export interface SleepDataModel {
-  format: 'oscar-profile-backup' | 'sql-bundle' | 'csv-bundle'
+  format: 'oscar-profile-backup' | 'sql-bundle' | 'csv-bundle' | 'raw-therapy-bundle'
   sourceFiles: number
   daily: DailyMetric[]
   sessions: SessionMetric[]
@@ -47,6 +47,8 @@ export async function parseSleepArchive(file: File): Promise<SleepDataModel> {
   const hasManifest = files.some((entry) => /(^|\/)manifest\.json$/i.test(entry.name))
   const sqlFiles = files.filter((entry) => /\.sql$/i.test(entry.name))
   const csvFiles = files.filter((entry) => /\.csv$/i.test(entry.name))
+  const edfFiles = files.filter((entry) => /\.edf$/i.test(entry.name))
+  const pdatFiles = files.filter((entry) => /\.pdat$/i.test(entry.name))
 
   if (hasManifest && sqlFiles.length > 0) {
     return parseSqlModel('oscar-profile-backup', sqlFiles, csvFiles)
@@ -56,12 +58,20 @@ export async function parseSleepArchive(file: File): Promise<SleepDataModel> {
     return parseSqlModel('sql-bundle', sqlFiles, csvFiles)
   }
 
+  if (edfFiles.length > 0) {
+    return parseRawTherapyBundle(edfFiles, pdatFiles)
+  }
+
+  if (pdatFiles.length > 0) {
+    return parseRawTherapyBundle([], pdatFiles)
+  }
+
   if (csvFiles.length > 0) {
     return parseCsvBundle(csvFiles)
   }
 
   throw new Error(
-    'Unsupported ZIP layout. Supported formats are OSCAR profile backups (.oscar) and CSV-based exports.'
+    'Unsupported ZIP layout. Supported formats are OSCAR profile backups (.oscar), raw therapy EDF/PDAT exports, and CSV-based exports.'
   )
 }
 
@@ -182,6 +192,97 @@ async function parseSqlModel(
   }
 }
 
+async function parseRawTherapyBundle(
+  edfFiles: JSZip.JSZipObject[],
+  pdatFiles: JSZip.JSZipObject[]
+): Promise<SleepDataModel> {
+  const warnings: string[] = []
+  const eventDistributionMap = new Map<string, number>()
+  const sessions: SessionMetric[] = []
+  const usageHoursByDate = new Map<string, number>()
+  const machineUsageMap = new Map<string, number>()
+  const rawTherapyFiles = [...edfFiles, ...pdatFiles]
+
+  for (const file of rawTherapyFiles) {
+    const raw = await file.async('uint8array')
+    const header = /\.edf$/i.test(file.name)
+      ? parseEdfHeader(raw, file.name)
+      : parsePdatHeader(raw, file.name)
+    warnings.push(...header.warnings)
+
+    if (!header.start) {
+      warnings.push(`Skipped raw therapy session without readable start time: ${file.name}`)
+      continue
+    }
+
+    const machineId = header.machineId ?? inferMachineIdFromPath(file.name)
+    const sessionId = file.name.split('/').pop() ?? file.name
+    const end =
+      header.durationMinutes !== null
+        ? new Date(new Date(header.start).getTime() + header.durationMinutes * 60_000).toISOString()
+        : null
+
+    sessions.push({
+      id: sessionId,
+      start: header.start,
+      end,
+      durationMinutes: header.durationMinutes,
+      machineId,
+      eventCount: 0,
+    })
+
+    const date = header.start.slice(0, 10)
+    if (header.durationMinutes !== null) {
+      const usageHours = header.durationMinutes / 60
+      usageHoursByDate.set(date, (usageHoursByDate.get(date) ?? 0) + usageHours)
+    }
+
+    const machineLabel = machineId ?? 'Unknown machine'
+    machineUsageMap.set(machineLabel, (machineUsageMap.get(machineLabel) ?? 0) + 1)
+
+    for (const label of header.signalLabels) {
+      const normalized = normalizeSignalLabel(label)
+      if (!normalized) continue
+      eventDistributionMap.set(normalized, (eventDistributionMap.get(normalized) ?? 0) + 1)
+    }
+  }
+
+  const daily: DailyMetric[] = [...usageHoursByDate.entries()]
+    .map(([date, usageHours]) => ({
+      date,
+      ahi: null,
+      usageHours,
+      leakRate: null,
+      pressure95: null,
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date))
+
+  sessions.sort((a, b) => (a.start ?? '').localeCompare(b.start ?? ''))
+
+  return {
+    format: 'raw-therapy-bundle',
+    sourceFiles: rawTherapyFiles.length,
+    daily,
+    sessions,
+    machineUsage: [...machineUsageMap.entries()].map(([name, sessionsCount]) => ({
+      name,
+      sessions: sessionsCount,
+    })),
+    eventDistribution: [...eventDistributionMap.entries()].map(([name, value]) => ({
+      name,
+      value,
+    })),
+    stats: {
+      totalDays: daily.length,
+      avgAhi: null,
+      avgUsageHours: averageNumber(daily.map((day) => day.usageHours)),
+      totalSessions: sessions.length,
+      totalRespiratoryEvents: 0,
+    },
+    warnings,
+  }
+}
+
 async function parseCsvBundle(csvFiles: JSZip.JSZipObject[]): Promise<SleepDataModel> {
   const warnings: string[] = []
   const pointsByDate = new Map<string, { ahi: number[]; usage: number[]; leak: number[] }>()
@@ -252,6 +353,179 @@ async function parseCsvBundle(csvFiles: JSZip.JSZipObject[]): Promise<SleepDataM
     },
     warnings,
   }
+}
+
+interface ParsedEdfHeader {
+  start: string | null
+  durationMinutes: number | null
+  signalLabels: string[]
+  machineId: string | null
+  warnings: string[]
+}
+
+function parseEdfHeader(content: Uint8Array, fileName: string): ParsedEdfHeader {
+  const warnings: string[] = []
+  if (content.byteLength < 256) {
+    warnings.push(`Skipped invalid EDF header (<256 bytes): ${fileName}`)
+    return { start: null, durationMinutes: null, signalLabels: [], machineId: null, warnings }
+  }
+
+  const text = new TextDecoder('ascii').decode(content.subarray(0, Math.min(content.byteLength, 8192)))
+  const patient = text.slice(8, 88).trim()
+  const recording = text.slice(88, 168).trim()
+  const dateField = text.slice(168, 176).trim()
+  const timeField = text.slice(176, 184).trim()
+  const dataRecordCount = parseInt(text.slice(236, 244).trim(), 10)
+  const dataRecordDurationSeconds = Number.parseFloat(text.slice(244, 252).trim())
+  const signalCount = parseInt(text.slice(252, 256).trim(), 10)
+
+  const start = parseEdfDateTime(dateField, timeField)
+  if (!start) {
+    warnings.push(`Could not parse EDF start date/time for ${fileName}: "${dateField} ${timeField}"`)
+  }
+
+  let durationMinutes: number | null = null
+  if (
+    Number.isFinite(dataRecordCount) &&
+    dataRecordCount > 0 &&
+    Number.isFinite(dataRecordDurationSeconds) &&
+    dataRecordDurationSeconds > 0
+  ) {
+    durationMinutes = (dataRecordCount * dataRecordDurationSeconds) / 60
+  }
+
+  const signalLabels: string[] = []
+  if (Number.isFinite(signalCount) && signalCount > 0) {
+    const labelOffset = 256
+    const labelsByteLength = signalCount * 16
+    if (content.byteLength >= labelOffset + labelsByteLength) {
+      for (let index = 0; index < signalCount; index += 1) {
+        const startByte = labelOffset + index * 16
+        const endByte = startByte + 16
+        const label = new TextDecoder('ascii').decode(content.subarray(startByte, endByte)).trim()
+        if (label) signalLabels.push(label)
+      }
+    } else {
+      warnings.push(`EDF signal label section is truncated for ${fileName}`)
+    }
+  }
+
+  const machineId = sanitizeMachineLabel(recording) ?? sanitizeMachineLabel(patient)
+  return { start, durationMinutes, signalLabels, machineId, warnings }
+}
+
+function parsePdatHeader(content: Uint8Array, fileName: string): ParsedEdfHeader {
+  const warnings: string[] = []
+  const contentSnippet = new TextDecoder('latin1').decode(
+    content.subarray(0, Math.min(content.byteLength, 4096))
+  )
+  const inferredStart = inferDateTimeFromText(contentSnippet) ?? inferDateTimeFromText(fileName)
+  if (!inferredStart) {
+    warnings.push(`Could not infer start date/time from PDAT file: ${fileName}`)
+  }
+
+  const machineId = inferMachineIdFromPath(fileName)
+  return {
+    start: inferredStart,
+    durationMinutes: null,
+    signalLabels: ['PDAT session'],
+    machineId,
+    warnings,
+  }
+}
+
+function parseEdfDateTime(dateField: string, timeField: string): string | null {
+  const dateMatch = dateField.match(/^(\d{2})[.-](\d{2})[.-](\d{2})$/)
+  const timeMatch = timeField.match(/^(\d{2})[.:-](\d{2})[.:-](\d{2})$/)
+  if (!dateMatch || !timeMatch) return null
+
+  const day = Number(dateMatch[1])
+  const month = Number(dateMatch[2])
+  const yy = Number(dateMatch[3])
+  const hour = Number(timeMatch[1])
+  const minute = Number(timeMatch[2])
+  const second = Number(timeMatch[3])
+  if (
+    !Number.isFinite(day) ||
+    !Number.isFinite(month) ||
+    !Number.isFinite(yy) ||
+    !Number.isFinite(hour) ||
+    !Number.isFinite(minute) ||
+    !Number.isFinite(second)
+  ) {
+    return null
+  }
+
+  const year = yy >= 85 ? 1900 + yy : 2000 + yy
+  const iso = new Date(Date.UTC(year, month - 1, day, hour, minute, second))
+  if (Number.isNaN(iso.getTime())) return null
+  return iso.toISOString()
+}
+
+function sanitizeMachineLabel(value: string | null): string | null {
+  if (!value) return null
+  const compact = value.replace(/\s+/g, ' ').trim()
+  if (!compact || /^x+$/i.test(compact) || /^unknown$/i.test(compact)) {
+    return null
+  }
+  return compact
+}
+
+function inferMachineIdFromPath(path: string): string | null {
+  const parts = path.split('/').filter(Boolean)
+  if (parts.length < 2) return null
+  return parts[parts.length - 2]
+}
+
+function inferDateTimeFromText(value: string): string | null {
+  const compactMatch = value.match(/(20\d{2})(\d{2})(\d{2})[^\d]?(\d{2})(\d{2})(\d{2})/)
+  if (compactMatch) {
+    const [, year, month, day, hour, minute, second] = compactMatch
+    return new Date(
+      Date.UTC(
+        Number(year),
+        Number(month) - 1,
+        Number(day),
+        Number(hour),
+        Number(minute),
+        Number(second)
+      )
+    ).toISOString()
+  }
+
+  const dashedMatch = value.match(
+    /(20\d{2})[./-](\d{2})[./-](\d{2})[^\d]+(\d{2})[:.-](\d{2})[:.-](\d{2})/
+  )
+  if (dashedMatch) {
+    const [, year, month, day, hour, minute, second] = dashedMatch
+    return new Date(
+      Date.UTC(
+        Number(year),
+        Number(month) - 1,
+        Number(day),
+        Number(hour),
+        Number(minute),
+        Number(second)
+      )
+    ).toISOString()
+  }
+
+  return null
+}
+
+function normalizeSignalLabel(value: string): string | null {
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  if (!normalized) return null
+  const lowered = normalized.toLowerCase()
+  if (lowered.includes('annotation') || lowered.includes('signal')) return null
+  if (lowered.includes('flow limitation')) return 'Flow Limitation'
+  if (lowered.includes('snore')) return 'Snore'
+  if (lowered.includes('leak')) return 'Leak'
+  if (lowered.includes('pressure')) return 'Pressure'
+  if (lowered.includes('resp') || lowered.includes('apnea') || lowered.includes('hypop')) {
+    return 'Respiratory signals'
+  }
+  return normalized
 }
 
 function extractInsertStatements(sql: string): { table: string; columns: string[]; values: string }[] {

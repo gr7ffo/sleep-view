@@ -32,7 +32,7 @@ function App() {
         <p className="eyebrow">Sleep View</p>
         <h1>Private sleep data insights, fully in your browser.</h1>
         <p className="hero-copy">
-          Upload an OSCAR-style ZIP export to explore trends and nightly patterns. Data never leaves
+          Upload OSCAR exports or raw device ZIP bundles (EDF/PDAT) to explore trends and nightly patterns. Data never leaves
           your device.
         </p>
         <label className="upload-panel" htmlFor="zip-upload">
@@ -43,7 +43,7 @@ function App() {
             accept=".zip,.oscar"
             onChange={(event) => void onFileChange(event.target.files?.[0] ?? null)}
           />
-          <small>Supported: OSCAR profile backup SQL bundles and CSV-based ZIP exports.</small>
+          <small>Supported: OSCAR profile backup SQL bundles, raw therapy EDF/PDAT bundles, and CSV-based ZIP exports.</small>
         </label>
         {isParsing && <p className="state">Parsing archive locally...</p>}
         {error && <p className="error">{error}</p>}
