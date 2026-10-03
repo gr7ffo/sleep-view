@@ -4,7 +4,7 @@ A privacy-first, fully client-side sleep-data visualizer for GitHub Pages.
 
 ## What it does
 
-- Accepts `.zip` / `.oscar` archives in the browser.
+- Accepts `.zip` / `.oscar` archives and standalone raw `.edf` / `.pdat` files in the browser.
 - Detects and parses practical OSCAR-compatible formats:
   - OSCAR profile backup bundles containing SQL payloads (`manifest.json` + `database/**/*.sql`)
   - Generic SQL-only bundles with OSCAR-style `INSERT INTO ... VALUES ...` statements

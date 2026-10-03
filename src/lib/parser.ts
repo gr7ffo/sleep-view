@@ -41,6 +41,27 @@ export interface SleepDataModel {
 }
 
 export async function parseSleepArchive(file: File): Promise<SleepDataModel> {
+  const loweredName = file.name.toLowerCase()
+  if (loweredName.endsWith('.edf')) {
+    return parseRawTherapyFiles([
+      {
+        name: file.name,
+        format: 'edf',
+        read: async () => new Uint8Array(await file.arrayBuffer()),
+      },
+    ])
+  }
+
+  if (loweredName.endsWith('.pdat')) {
+    return parseRawTherapyFiles([
+      {
+        name: file.name,
+        format: 'pdat',
+        read: async () => new Uint8Array(await file.arrayBuffer()),
+      },
+    ])
+  }
+
   const zip = await JSZip.loadAsync(file)
   const files = Object.values(zip.files).filter((entry) => !entry.dir)
 
@@ -196,18 +217,38 @@ async function parseRawTherapyBundle(
   edfFiles: JSZip.JSZipObject[],
   pdatFiles: JSZip.JSZipObject[]
 ): Promise<SleepDataModel> {
+  const rawTherapyFiles: RawTherapyFileSource[] = [
+    ...edfFiles.map((file) => ({
+      name: file.name,
+      format: 'edf' as const,
+      read: async () => file.async('uint8array'),
+    })),
+    ...pdatFiles.map((file) => ({
+      name: file.name,
+      format: 'pdat' as const,
+      read: async () => file.async('uint8array'),
+    })),
+  ]
+  return parseRawTherapyFiles(rawTherapyFiles)
+}
+
+interface RawTherapyFileSource {
+  name: string
+  format: 'edf' | 'pdat'
+  read: () => Promise<Uint8Array>
+}
+
+async function parseRawTherapyFiles(rawTherapyFiles: RawTherapyFileSource[]): Promise<SleepDataModel> {
   const warnings: string[] = []
   const eventDistributionMap = new Map<string, number>()
   const sessions: SessionMetric[] = []
   const usageHoursByDate = new Map<string, number>()
   const machineUsageMap = new Map<string, number>()
-  const rawTherapyFiles = [...edfFiles, ...pdatFiles]
 
   for (const file of rawTherapyFiles) {
-    const raw = await file.async('uint8array')
-    const header = /\.edf$/i.test(file.name)
-      ? parseEdfHeader(raw, file.name)
-      : parsePdatHeader(raw, file.name)
+    const raw = await file.read()
+    const header =
+      file.format === 'edf' ? parseEdfHeader(raw, file.name) : parsePdatHeader(raw, file.name)
     warnings.push(...header.warnings)
 
     if (!header.start) {
