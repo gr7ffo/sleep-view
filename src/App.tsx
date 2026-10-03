@@ -32,8 +32,8 @@ function App() {
         <p className="eyebrow">Sleep View</p>
         <h1>Private sleep data insights, fully in your browser.</h1>
         <p className="hero-copy">
-          Upload OSCAR exports or raw device ZIP bundles (EDF/PDAT) to explore trends and nightly patterns. Data never leaves
-          your device.
+          Upload OSCAR exports, ZIP bundles, or standalone raw therapy EDF/PDAT files to explore trends and nightly patterns.
+          Data never leaves your device.
         </p>
         <label className="upload-panel" htmlFor="sleep-data-upload">
           <span>Upload sleep data file</span>
