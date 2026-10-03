@@ -62,7 +62,26 @@ export async function parseSleepArchive(file: File): Promise<SleepDataModel> {
     ])
   }
 
-  const zip = await JSZip.loadAsync(file)
+  const fileBytes = new Uint8Array(await file.arrayBuffer())
+  const sniffedRawFormat = sniffRawTherapyFormat(fileBytes)
+  if (sniffedRawFormat) {
+    return parseRawTherapyFiles([
+      {
+        name: file.name,
+        format: sniffedRawFormat,
+        read: async () => fileBytes,
+      },
+    ])
+  }
+
+  let zip: JSZip
+  try {
+    zip = await JSZip.loadAsync(fileBytes)
+  } catch {
+    throw new Error(
+      'Unsupported file. Supported formats are OSCAR profile backups (.oscar/.zip), raw therapy EDF/PDAT exports, and CSV-based ZIP exports.'
+    )
+  }
   const files = Object.values(zip.files).filter((entry) => !entry.dir)
 
   const hasManifest = files.some((entry) => /(^|\/)manifest\.json$/i.test(entry.name))
@@ -73,6 +92,28 @@ export async function parseSleepArchive(file: File): Promise<SleepDataModel> {
 
   if (hasManifest && sqlFiles.length > 0) {
     return parseSqlModel('oscar-profile-backup', sqlFiles, csvFiles)
+  }
+
+  function sniffRawTherapyFormat(content: Uint8Array): RawTherapyFileSource['format'] | null {
+    if (looksLikeEdfContent(content)) return 'edf'
+    if (looksLikePdatContent(content)) return 'pdat'
+    return null
+  }
+
+  function looksLikeEdfContent(content: Uint8Array): boolean {
+    if (content.byteLength < 256) return false
+    const header = new TextDecoder('ascii').decode(content.subarray(0, 256))
+    const dateField = header.slice(168, 176).trim()
+    const timeField = header.slice(176, 184).trim()
+    return parseEdfDateTime(dateField, timeField) !== null
+  }
+
+  function looksLikePdatContent(content: Uint8Array): boolean {
+    const contentSnippet = new TextDecoder('latin1').decode(
+      content.subarray(0, Math.min(content.byteLength, 4096))
+    )
+    if (/\bpdat\b/i.test(contentSnippet)) return true
+    return inferDateTimeFromText(contentSnippet) !== null
   }
 
   if (sqlFiles.length > 0) {

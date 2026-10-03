@@ -9,6 +9,7 @@ A privacy-first, fully client-side sleep-data visualizer for GitHub Pages.
   - OSCAR profile backup bundles containing SQL payloads (`manifest.json` + `database/**/*.sql`)
   - Generic SQL-only bundles with OSCAR-style `INSERT INTO ... VALUES ...` statements
   - Raw therapy bundles containing `.edf` and/or `.pdat` files (metadata/session extraction)
+  - Raw therapy files with non-standard extensions when content signatures match EDF/PDAT
   - CSV-based ZIP exports (fallback parser)
 - Translates parsed records into a normalized in-memory model for trends and metrics.
 - Renders interactive charts (nightly trends, event distribution, machine mix).
