@@ -10,6 +10,9 @@ A privacy-first, fully client-side sleep-data visualizer for GitHub Pages.
   - Generic SQL-only bundles with OSCAR-style `INSERT INTO ... VALUES ...` statements
   - Raw therapy bundles containing `.edf` and/or `.pdat` files (metadata/session extraction)
   - Raw therapy files with non-standard extensions when content signatures match EDF/PDAT
+  - Löwenstein/Weinmann **prisma** `.pdat` exports — both ZIP-wrapped therapy exports and
+    plain WMEDF signal payloads (`#s-1` header) — with nightly AHI, usage, leak and
+    pressure metrics from `event_*.xml` / `signal_*.wmedf` data
   - CSV-based ZIP exports (fallback parser)
 - Translates parsed records into a normalized in-memory model for trends and metrics.
 - Renders interactive charts (nightly trends, event distribution, machine mix).

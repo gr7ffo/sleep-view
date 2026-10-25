@@ -40,10 +40,13 @@ function App() {
           <input
             id="sleep-data-upload"
             type="file"
-            accept=".zip,.oscar,.edf,.pdat,.webp"
+            accept=".zip,.oscar,.edf,.pdat,.wmedf,.webp"
             onChange={(event) => void onFileChange(event.target.files?.[0] ?? null)}
           />
-          <small>Supported: .zip/.oscar archives and raw therapy files (.edf/.pdat), including renamed uploads.</small>
+          <small>
+            Supported: .zip/.oscar archives and raw therapy files (.edf/.pdat), including
+            Löwenstein/Weinmann prisma exports (ZIP-wrapped or plain WMEDF payloads).
+          </small>
         </label>
         {isParsing && <p className="state">Parsing file locally...</p>}
         {error && <p className="error">{error}</p>}

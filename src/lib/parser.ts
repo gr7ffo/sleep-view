@@ -24,7 +24,12 @@ export interface SessionMetric {
 }
 
 export interface SleepDataModel {
-  format: 'oscar-profile-backup' | 'sql-bundle' | 'csv-bundle' | 'raw-therapy-bundle'
+  format:
+    | 'oscar-profile-backup'
+    | 'sql-bundle'
+    | 'csv-bundle'
+    | 'raw-therapy-bundle'
+    | 'prisma-pdat'
   sourceFiles: number
   daily: DailyMetric[]
   sessions: SessionMetric[]
@@ -53,18 +58,20 @@ export async function parseSleepArchive(file: File): Promise<SleepDataModel> {
   }
 
   if (loweredName.endsWith('.pdat')) {
-    return parseRawTherapyFiles([
-      {
-        name: file.name,
-        format: 'pdat',
-        read: async () => new Uint8Array(await file.arrayBuffer()),
-      },
-    ])
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    const collector = createPrismaCollector()
+    await collectPdatBytes(bytes, file.name, collector)
+    return buildPrismaModel(collector)
   }
 
   const fileBytes = new Uint8Array(await file.arrayBuffer())
   const sniffedRawFormat = sniffRawTherapyFormat(fileBytes)
   if (sniffedRawFormat) {
+    if (sniffedRawFormat === 'pdat') {
+      const collector = createPrismaCollector()
+      await collectPdatBytes(fileBytes, file.name, collector)
+      return buildPrismaModel(collector)
+    }
     return parseRawTherapyFiles([
       {
         name: file.name,
@@ -92,6 +99,14 @@ export async function parseSleepArchive(file: File): Promise<SleepDataModel> {
 
   if (hasManifest && sqlFiles.length > 0) {
     return parseSqlModel('oscar-profile-backup', sqlFiles, csvFiles)
+  }
+
+  const prismaEventEntries = files.filter((entry) => /event_\d+\.xml$/i.test(entry.name))
+  const prismaSignalEntries = files.filter((entry) => /signal_\d+\.wmedf$/i.test(entry.name))
+  if (prismaEventEntries.length > 0 || prismaSignalEntries.length > 0) {
+    const collector = createPrismaCollector()
+    await collectPrismaZipEntries(files, file.name, collector)
+    return buildPrismaModel(collector)
   }
 
   function sniffRawTherapyFormat(content: Uint8Array): RawTherapyFileSource['format'] | null {
@@ -258,15 +273,29 @@ async function parseRawTherapyBundle(
   edfFiles: JSZip.JSZipObject[],
   pdatFiles: JSZip.JSZipObject[]
 ): Promise<SleepDataModel> {
+  if (pdatFiles.length > 0) {
+    // Weinmann/Löwenstein therapy exports win over the simple header sniffing path:
+    // every PDAT payload goes through the structured prisma collector, which
+    // understands ZIP-wrapped exports, plain WMEDF payloads and header-only
+    // fallbacks.
+    const collector = createPrismaCollector()
+    if (edfFiles.length > 0) {
+      collector.warnings.push(
+        `Skipped ${edfFiles.length} EDF file(s) in favour of the structured prisma export (PDAT).`
+      )
+    }
+    for (const pdatFile of pdatFiles) {
+      const bytes = await pdatFile.async('uint8array')
+      await collectPdatBytes(bytes, pdatFile.name, collector)
+    }
+    const model = buildPrismaModel(collector)
+    return model
+  }
+
   const rawTherapyFiles: RawTherapyFileSource[] = [
     ...edfFiles.map((file) => ({
       name: file.name,
       format: 'edf' as const,
-      read: async () => file.async('uint8array'),
-    })),
-    ...pdatFiles.map((file) => ({
-      name: file.name,
-      format: 'pdat' as const,
       read: async () => file.async('uint8array'),
     })),
   ]
@@ -542,6 +571,665 @@ function parseEdfDateTime(dateField: string, timeField: string): string | null {
   const iso = new Date(Date.UTC(year, month - 1, day, hour, minute, second))
   if (Number.isNaN(iso.getTime())) return null
   return iso.toISOString()
+}
+
+const PRISMA_MACHINE_LABEL = 'Weinmann/Löwenstein prisma'
+
+/** RespEventID taxonomy of Weinmann/Löwenstein prisma devices (per OSCAR prisma_loader). */
+const PRISMA_RESP_EVENT_LABELS = new Map<number, string>([
+  [1, 'Epoch: severe obstruction'],
+  [2, 'Epoch: mild obstruction'],
+  [3, 'Epoch: flow limitation'],
+  [4, 'Epoch: snore'],
+  [5, 'Epoch: periodic breathing'],
+  [101, 'Obstructive apnea'],
+  [102, 'Central apnea'],
+  [103, 'Apnea (overview leak)'],
+  [105, 'Apnea (high pressure)'],
+  [106, 'Apnea (movement)'],
+  [111, 'Obstructive hypopnea'],
+  [112, 'Central hypopnea'],
+  [113, 'Hypopnea (overview leak)'],
+  [121, 'RERA'],
+  [131, 'Snore'],
+  [141, 'Artifact'],
+  [151, 'Flow limitation'],
+  [161, 'Critical leak'],
+  [181, 'Cheyne-Stokes respiration'],
+  [221, 'Timed breath'],
+  [261, 'Epoch: deep sleep'],
+])
+
+/** RespEventIDs that contribute to the device AHI: apneas + hypopneas. */
+const PRISMA_AHI_EVENT_IDS = new Set([101, 102, 103, 105, 106, 111, 112, 113])
+
+interface Weighted {
+  sum: number
+  weight: number
+}
+
+interface PrismaRespEvent {
+  id: number
+  endTime: number
+  duration: number
+  pressure: number
+  strength: number
+}
+
+interface PrismaEventXml {
+  parameters: Map<number, number>
+  respEvents: PrismaRespEvent[]
+}
+
+interface WmedfSignal {
+  label: string
+  unit: string
+  bytesPerSample: number
+  samplesPerRecord: number
+  signed: boolean
+  gain: number
+  offset: number
+}
+
+interface WmedfFile {
+  recordDurationSeconds: number
+  signals: WmedfSignal[]
+  headerBytes: number
+  recordBytes: number
+  recordCount: number
+}
+
+interface PrismaCollector {
+  warnings: string[]
+  eventDistribution: Map<string, number>
+  ahiCountByDate: Map<string, number>
+  usageSecondsByDate: Map<string, number>
+  leakMedianByDate: Map<string, Weighted>
+  pressureP95ByDate: Map<string, Weighted>
+  sessions: SessionMetric[]
+  machineSerial: string | null
+  machineLabel: string | null
+  sourceCount: number
+}
+
+function createPrismaCollector(): PrismaCollector {
+  return {
+    warnings: [],
+    eventDistribution: new Map(),
+    ahiCountByDate: new Map(),
+    usageSecondsByDate: new Map(),
+    leakMedianByDate: new Map(),
+    pressureP95ByDate: new Map(),
+    sessions: [],
+    machineSerial: null,
+    machineLabel: null,
+    sourceCount: 0,
+  }
+}
+
+/**
+ * Routes a PDAT payload by content:
+ * - `PK…` bytes → ZIP-wrapped therapy export (unzip + structured scan)
+ * - `#s-1` marker → plain Weinmann WMEDF signal file
+ * - otherwise → legacy heuristic header extraction
+ */
+async function collectPdatBytes(
+  bytes: Uint8Array,
+  fileName: string,
+  collector: PrismaCollector
+): Promise<void> {
+  collector.sourceCount += 1
+
+  if (bytes.byteLength >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b) {
+    const zip = await JSZip.loadAsync(bytes)
+    const entries = Object.values(zip.files).filter((entry) => !entry.dir)
+    await collectPrismaZipEntries(entries, fileName, collector)
+    return
+  }
+
+  const signals = parseWmedfFile(bytes)
+  if (signals) {
+    collectWmedfSignal(bytes, fileName, signals, collector)
+    return
+  }
+
+  collector.warnings.push(
+    `PDAT payload in ${fileName} contained no recognizable Weinmann data; falling back to heuristic header extraction.`
+  )
+  const header = parsePdatHeader(bytes, fileName)
+  collector.warnings.push(...header.warnings)
+  collectHeaderOnlySession(header, fileName, collector)
+}
+
+function collectHeaderOnlySession(header: ParsedEdfHeader, fileName: string, collector: PrismaCollector): void {
+  if (!header.start) return
+  const sessionId = fileName.split('/').pop() ?? fileName
+  const end =
+    header.durationMinutes !== null
+      ? new Date(new Date(header.start).getTime() + header.durationMinutes * 60_000).toISOString()
+      : null
+  collector.sessions.push({
+    id: sessionId,
+    start: header.start,
+    end,
+    durationMinutes: header.durationMinutes,
+    machineId: collector.machineLabel ?? 'prisma',
+    eventCount: 0,
+  })
+  if (header.durationMinutes !== null) {
+    addUsageSeconds(collector, header.start.slice(0, 10), header.durationMinutes * 60)
+  }
+  ensureMachineLabel(collector)
+}
+
+/** Machine info + session XML/WMEDF scan of an unzipped therapy export. */
+async function collectPrismaZipEntries(
+  entries: JSZip.JSZipObject[],
+  archiveName: string,
+  collector: PrismaCollector
+): Promise<void> {
+  const eventEntries = entries.filter((entry) => /event_\d+\.xml$/i.test(entry.name))
+  const signalEntries = entries.filter((entry) => /signal_\d+\.wmedf$/i.test(entry.name))
+
+  if (eventEntries.length === 0 && signalEntries.length === 0) {
+    // Nested pdat payloads (e.g. a tar/zip bundle that itself contains *.pdat files)?
+    const nestedPdat = entries.filter((entry) => /\.pdat$/i.test(entry.name))
+    if (nestedPdat.length > 0 && nestedPdat.length < 500) {
+      for (const entry of nestedPdat) {
+        const bytes = await entry.async('uint8array')
+        await collectPdatBytes(bytes, entry.name, collector)
+      }
+      return
+    }
+    collector.warnings.push(`No Weinmann prisma data found in ${archiveName}.`)
+    return
+  }
+
+  await collectDeviceXml(entries, collector)
+
+  const eventsBySessionId = new Map<number, PrismaEventXml>()
+  for (const entry of eventEntries) {
+    const sessionId = prismaSessionIdOf(entry.name)
+    if (sessionId === null) continue
+    eventsBySessionId.set(sessionId, parsePrismaEventXml(await entry.async('uint8array')))
+  }
+
+  const signalsBySessionId = new Map<number, JSZip.JSZipObject>()
+  for (const entry of signalEntries) {
+    const sessionId = prismaSessionIdOf(entry.name)
+    if (sessionId === null) continue
+    signalsBySessionId.set(sessionId, entry)
+  }
+
+  const sessionIds = [...new Set([...eventsBySessionId.keys(), ...signalsBySessionId.keys()])].sort(
+    (a, b) => a - b
+  )
+
+  for (const sessionId of sessionIds) {
+    const dayDate = prismaDayDateOf(entryNameFor(signalEntries, sessionId)) ?? prismaDayDateOf(entryNameFor(eventEntries, sessionId))
+    const eventXml = eventsBySessionId.get(sessionId)
+    const signalEntry = signalsBySessionId.get(sessionId)
+
+    let start: string | null = null
+    let durationSeconds: number | null = null
+
+    if (signalEntry) {
+      const bytes = await signalEntry.async('uint8array')
+      const parsed = parseWmedfFile(bytes)
+      if (parsed) {
+        start = parseWmedfStart(bytes) ?? (dayDate ? `${dayDate}T00:00:00.000Z` : null)
+        durationSeconds = parsed.recordCount * parsed.recordDurationSeconds
+        collectWmedfStatistics(bytes, parsed, fileNameOf(signalEntry), dayDate, collector)
+      } else {
+        collector.warnings.push(`Could not parse WMEDF header of ${fileNameOf(signalEntry)}.`)
+      }
+    } else if (dayDate) {
+      start = `${dayDate}T00:00:00.000Z`
+    }
+
+    let ahiCount = 0
+    if (eventXml) {
+      ahiCount = collectRespEvents(eventXml.respEvents, dayDate, collector)
+    }
+
+    const sessionIdLabel = `${dayDate ?? 'unknown-day'}/${String(sessionId).padStart(6, '0')}`
+    const end =
+      start !== null && durationSeconds !== null
+        ? new Date(new Date(start).getTime() + durationSeconds * 1000).toISOString()
+        : null
+
+    collector.sessions.push({
+      id: sessionIdLabel,
+      start,
+      end,
+      durationMinutes: durationSeconds !== null ? durationSeconds / 60 : null,
+      machineId: collector.machineSerial ?? collector.machineLabel ?? 'prisma',
+      eventCount: ahiCount,
+    })
+
+    if (durationSeconds !== null && dayDate) {
+      addUsageSeconds(collector, dayDate, durationSeconds)
+    }
+  }
+
+  ensureMachineLabel(collector)
+}
+
+function fileNameOf(entry: JSZip.JSZipObject): string {
+  return entry.name.split('/').pop() ?? entry.name
+}
+
+function entryNameFor(entries: JSZip.JSZipObject[], sessionId: number): string | null {
+  for (const entry of entries) {
+    if (prismaSessionIdOf(entry.name) === sessionId) return entry.name
+  }
+  return null
+}
+
+function prismaSessionIdOf(name: string): number | null {
+  const match = name.match(/(?:event|signal)_(\d+)\./i)
+  if (!match) return null
+  const value = Number.parseInt(match[1], 10)
+  return Number.isFinite(value) ? value : null
+}
+
+/** The per-night folder date next to a signal/event file ("20220328" → "2022-03-28"). */
+function prismaDayDateOf(path: string | null): string | null {
+  if (!path) return null
+  const match = path.match(/\/(\d{8})\//)
+  if (!match) return null
+  const digits = match[1]
+  if (!/^\d{8}$/.test(digits)) return null
+  const year = digits.slice(0, 4)
+  const month = Number(digits.slice(4, 6))
+  const day = Number(digits.slice(6))
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+}
+
+async function collectDeviceXml(entries: JSZip.JSZipObject[], collector: PrismaCollector): Promise<void> {
+  const deviceEntry = entries.find((entry) => /(^|\/)device\.xml$/i.test(entry.name))
+  if (!deviceEntry) return
+  const xml = new TextDecoder('latin1').decode(await deviceEntry.async('uint8array'))
+  const serial = xml.match(/DeviceSerialNumber value="([^"]*)"/)?.[1]
+  const fwVersion = xml.match(/FWVersion value="([^"]*)"/)?.[1]
+  const fwBuild = xml.match(/FWBuild value="([^"]*)"/)?.[1]
+  if (serial) collector.machineSerial = serial
+  const buildName = fwBuild && /Eyra/i.test(fwBuild) ? ' Eyra' : ''
+  collector.machineLabel = fwVersion
+    ? `${PRISMA_MACHINE_LABEL}${buildName} FW ${fwVersion}`
+    : `${PRISMA_MACHINE_LABEL}${buildName}`
+}
+
+function ensureMachineLabel(collector: PrismaCollector): void {
+  if (!collector.machineLabel) {
+    collector.machineLabel = `${PRISMA_MACHINE_LABEL} (WMEDF signal)`
+  }
+}
+
+/**
+ * Resp event taxonomy: distribution + per-day AHI event count.
+ * Returns the AHI event count of this file.
+ */
+function collectRespEvents(
+  respEvents: PrismaRespEvent[],
+  dayDate: string | null,
+  collector: PrismaCollector
+): number {
+  let ahiCount = 0
+  for (const event of respEvents) {
+    const label = PRISMA_RESP_EVENT_LABELS.get(event.id)
+    if (!label) continue
+    collector.eventDistribution.set(label, (collector.eventDistribution.get(label) ?? 0) + 1)
+    if (PRISMA_AHI_EVENT_IDS.has(event.id)) ahiCount += 1
+  }
+
+  if (ahiCount > 0 && dayDate) {
+    collector.ahiCountByDate.set(dayDate, (collector.ahiCountByDate.get(dayDate) ?? 0) + ahiCount)
+  }
+  return ahiCount
+}
+
+/** `<DeviceEvent … />` device parameters and `<RespEvent … />` events. */
+function parsePrismaEventXml(content: Uint8Array): PrismaEventXml {
+  const xml = new TextDecoder('latin1').decode(content)
+  const parameters = new Map<number, number>()
+  const respEvents: PrismaRespEvent[] = []
+
+  for (const tag of xml.matchAll(/<DeviceEvent\s+([^>]*)\/>/g)) {
+    const attributes = parseXmlAttributes(tag[1])
+    if ((attributes.DeviceEventID ?? '0') !== '0') continue
+    const parameterId = Number.parseInt(attributes.ParameterID ?? '', 10)
+    const value = Number.parseInt(attributes.NewValue ?? '', 10)
+    if (Number.isFinite(parameterId) && Number.isFinite(value)) {
+      parameters.set(parameterId, value)
+    }
+  }
+
+  for (const tag of xml.matchAll(/<RespEvent\s+([^>]*)\/>/g)) {
+    const attributes = parseXmlAttributes(tag[1])
+    const id = Number.parseInt(attributes.RespEventID ?? '', 10)
+    if (!Number.isFinite(id)) continue
+    respEvents.push({
+      id,
+      endTime: Number.parseInt(attributes.EndTime ?? '0', 10),
+      duration: Number.parseInt(attributes.Duration ?? '0', 10),
+      pressure: Number.parseInt(attributes.Pressure ?? '0', 10),
+      strength: Number.parseInt(attributes.Strength ?? '0', 10),
+    })
+  }
+
+  return { parameters, respEvents }
+}
+
+function parseXmlAttributes(attributes: string): Record<string, string> {
+  const result: Record<string, string> = {}
+  for (const match of attributes.matchAll(/(\w+)="([^"]*)"/g)) {
+    result[match[1]] = match[2]
+  }
+  return result
+}
+
+/**
+ * Weinmann WMEDF: an EDF-variant with ASCII fixed-width headers and per-signal
+ * sample widths (`#1` = 8 bit, `#2` = 16 bit) at 1-second data records.
+ */
+function parseWmedfFile(content: Uint8Array): WmedfFile | null {
+  if (content.byteLength < 1024) return null
+
+  const markerText = decodeLatin1Slice(content, 0, Math.min(content.byteLength, 8192))
+  const markerOffset = markerText.indexOf('#s-1')
+  if (markerOffset < 0) return null
+
+  const numbers = markerText.slice(markerOffset + 4, markerOffset + 104).match(/\d+/g) ?? []
+  const recordDurationSeconds = numbers.length >= 2 ? Number(numbers[0]) : 1
+  const signalCount = Number(numbers[numbers.length - 1])
+  if (!Number.isFinite(signalCount) || signalCount <= 0 || signalCount > 64) return null
+  if (
+    !Number.isFinite(recordDurationSeconds) ||
+    recordDurationSeconds < 0.01 ||
+    recordDurationSeconds > 60
+  ) {
+    return null
+  }
+
+  const signalNames: string[] = []
+  for (let index = 0; index < signalCount; index += 1) {
+    signalNames.push(decodeLatin1Slice(content, 256 + index * 16, 16).trim())
+  }
+
+  const transducerOffset = 256 + signalCount * 16
+  const unitsOffset = transducerOffset + signalCount * 80
+  const physMinOffset = unitsOffset + signalCount * 8
+  const physMaxOffset = physMinOffset + signalCount * 8
+  const digMinOffset = physMaxOffset + signalCount * 8
+  const digMaxOffset = digMinOffset + signalCount * 8
+  const filterOffset = digMaxOffset + signalCount * 8
+  const sampleCountOffset = filterOffset + signalCount * 80
+  const reservedOffset = sampleCountOffset + signalCount * 8
+  const headerBytes = reservedOffset + signalCount * 32
+  if (content.byteLength < headerBytes) return null
+
+  const readTextField = (offset: number, length: number) =>
+    decodeLatin1Slice(content, offset, length).trim()
+  const readNumberField = (offset: number, length: number) =>
+    Number.parseFloat(readTextField(offset, length))
+
+  const signals: WmedfSignal[] = []
+  for (let index = 0; index < signalCount; index += 1) {
+    const physMin = readNumberField(physMinOffset + index * 8, 8)
+    const physMax = readNumberField(physMaxOffset + index * 8, 8)
+    const digMin = readNumberField(digMinOffset + index * 8, 8)
+    const digMax = readNumberField(digMaxOffset + index * 8, 8)
+    const sampleCountText = readTextField(sampleCountOffset + index * 8, 8)
+    const reserved = decodeLatin1Slice(content, reservedOffset + index * 32 + 30, 2)
+    const bytesPerSample = reserved === '#2' ? 2 : 1
+    const samplesPerRecord = Math.max(1, Number.parseInt(sampleCountText, 10) || 1)
+    if (!Number.isFinite(physMin) || !Number.isFinite(physMax)) return null
+    if (!Number.isFinite(digMin) || !Number.isFinite(digMax) || digMax === digMin) return null
+
+    const gain = (physMax - physMin) / (digMax - digMin)
+    signals.push({
+      label: signalNames[index],
+      unit: readTextField(unitsOffset + index * 8, 8),
+      bytesPerSample,
+      samplesPerRecord,
+      signed: digMin < 0,
+      gain,
+      offset: physMin - gain * digMin,
+    })
+  }
+
+  const recordBytes = signals.reduce(
+    (total, signal) => total + signal.bytesPerSample * signal.samplesPerRecord,
+    0
+  )
+  if (recordBytes <= 0) return null
+
+  const available = content.byteLength - headerBytes
+  if (available < 0) return null
+  const recordCount = Math.floor(available / recordBytes)
+
+  return {
+    recordDurationSeconds,
+    signals,
+    headerBytes,
+    recordBytes,
+    recordCount,
+  }
+}
+
+function decodeLatin1Slice(content: Uint8Array, offset: number, length: number): string {
+  const decoder = new TextDecoder('latin1')
+  return decoder.decode(content.subarray(offset, Math.min(offset + length, content.byteLength)))
+}
+
+/** WMEDF header: date at 168 ("dd.mm.yy"), time at 176 ("hh.mm.ss…"). */
+function parseWmedfStart(content: Uint8Array): string | null {
+  const dateField = decodeLatin1Slice(content, 168, 8).trim()
+  const timeField = decodeLatin1Slice(content, 176, 12).trim()
+  const start = parseEdfDateTime(dateField, timeField)
+  if (start) return start
+
+  const recording = decodeLatin1Slice(content, 88, 80)
+  const recordingMatch = recording.match(/(\d{2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2}):(\d{2})/)
+  if (!recordingMatch) return null
+  const [, day, month, year, hour, minute, second] = recordingMatch
+  const iso = new Date(
+    Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second))
+  )
+  return Number.isNaN(iso.getTime()) ? null : iso.toISOString()
+}
+
+/** Simplest WMEDF path: single signal session with per-channel statistics. */
+function collectWmedfSignal(
+  content: Uint8Array,
+  fileName: string,
+  wmedf: WmedfFile,
+  collector: PrismaCollector
+): void {
+  if (wmedf.recordCount <= 0) {
+    collector.warnings.push(`WMEDF file contains no data records: ${fileName}`)
+    return
+  }
+
+  const start = parseWmedfStart(content)
+  if (!start) {
+    collector.warnings.push(`Could not read start date/time of WMEDF file: ${fileName}`)
+    return
+  }
+
+  const dayDate = start.slice(0, 10)
+  const durationSeconds = wmedf.recordCount * wmedf.recordDurationSeconds
+
+  collector.sessions.push({
+    id: fileName.split('/').pop() ?? fileName,
+    start,
+    end: new Date(new Date(start).getTime() + durationSeconds * 1000).toISOString(),
+    durationMinutes: durationSeconds / 60,
+    machineId: PRISMA_MACHINE_LABEL,
+    eventCount: 0,
+  })
+
+  addUsageSeconds(collector, dayDate, durationSeconds)
+  collectWmedfStatistics(content, wmedf, fileName, dayDate, collector)
+  ensureMachineLabel(collector)
+}
+
+/** Per-file pressure/leak channel statistics, folded into per-day aggregates. */
+function collectWmedfStatistics(
+  content: Uint8Array,
+  wmedf: WmedfFile,
+  fileName: string,
+  dayDate: string | null,
+  collector: PrismaCollector
+): void {
+  if (wmedf.recordCount <= 0 || !dayDate) return
+
+  const pressure = decodeWmedfChannel(content, wmedf, 'Pressure')
+  const leak = decodeWmedfChannel(content, wmedf, 'LeakFlowBreath')
+
+  if (pressure && pressure.values.length > 0) {
+    const p95 = quantile(pressure.values, 0.95)
+    if (Number.isFinite(p95)) {
+      addToWeighted(collector.pressureP95ByDate, dayDate, p95, wmedf.recordCount)
+    }
+  } else {
+    collector.warnings.push(`No pressure channel readable in ${fileName}.`)
+  }
+
+  if (leak && leak.values.length > 0) {
+    const median = quantile(leak.values, 0.5)
+    if (Number.isFinite(median)) {
+      addToWeighted(collector.leakMedianByDate, dayDate, median, wmedf.recordCount)
+    }
+  } else {
+    collector.warnings.push(`No leak channel readable in ${fileName}.`)
+  }
+}
+
+interface DecodedWmedfChannel {
+  unit: string
+  values: number[]
+}
+
+function decodeWmedfChannel(
+  content: Uint8Array,
+  wmedf: WmedfFile,
+  label: string
+): DecodedWmedfChannel | null {
+  let signalIndex = -1
+  let leadingBytes = 0
+  for (let index = 0; index < wmedf.signals.length; index += 1) {
+    if (wmedf.signals[index].label === label) {
+      signalIndex = index
+      break
+    }
+    leadingBytes += wmedf.signals[index].bytesPerSample * wmedf.signals[index].samplesPerRecord
+  }
+  if (signalIndex < 0) return null
+
+  const signal = wmedf.signals[signalIndex]
+  const values: number[] = []
+  const view = new DataView(content.buffer, content.byteOffset, content.byteLength)
+
+  for (let record = 0; record < wmedf.recordCount; record += 1) {
+    const recordStart =
+      wmedf.headerBytes + record * wmedf.recordBytes + leadingBytes
+    for (let sample = 0; sample < signal.samplesPerRecord; sample += 1) {
+      const sampleOffset = recordStart + sample * signal.bytesPerSample
+      if (sampleOffset + signal.bytesPerSample > view.byteLength) break
+      let raw: number
+      if (signal.bytesPerSample === 2) {
+        raw = view.getInt16(sampleOffset, true)
+      } else if (signal.signed) {
+        raw = view.getInt8(sampleOffset)
+      } else {
+        raw = view.getUint8(sampleOffset)
+      }
+      values.push(raw * signal.gain + signal.offset)
+    }
+  }
+
+  return { unit: signal.unit, values }
+}
+
+function quantile(values: number[], q: number): number {
+  if (values.length === 0) return Number.NaN
+  const sorted = [...values].sort((a, b) => a - b)
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.floor(q * sorted.length)))
+  return sorted[index]
+}
+
+function addToWeighted(map: Map<string, Weighted>, key: string, value: number, weight: number): void {
+  const bucket = map.get(key) ?? { sum: 0, weight: 0 }
+  bucket.sum += value * weight
+  bucket.weight += weight
+  map.set(key, bucket)
+}
+
+function addUsageSeconds(collector: PrismaCollector, date: string, seconds: number): void {
+  collector.usageSecondsByDate.set(date, (collector.usageSecondsByDate.get(date) ?? 0) + seconds)
+}
+
+function buildPrismaModel(collector: PrismaCollector): SleepDataModel {
+  const dates = new Set<string>([
+    ...collector.usageSecondsByDate.keys(),
+    ...collector.ahiCountByDate.keys(),
+  ])
+
+  const daily: DailyMetric[] = [...dates]
+    .sort()
+    .map((date) => {
+      const usageSeconds = collector.usageSecondsByDate.get(date) ?? 0
+      const usageHours = usageSeconds / 3600
+      const ahiCount = collector.ahiCountByDate.get(date)
+      const leakMedian = collector.leakMedianByDate.get(date)
+      const pressureP95 = collector.pressureP95ByDate.get(date)
+      const weightAvg = (bucket: Weighted | undefined) =>
+        bucket && bucket.weight > 0 ? bucket.sum / bucket.weight : null
+
+      return {
+        date,
+        ahi: usageHours > 0 && ahiCount !== undefined ? ahiCount / usageHours : null,
+        usageHours: usageSeconds > 0 ? usageHours : null,
+        leakRate: leakMedian ? weightAvg(leakMedian) : null,
+        pressure95: pressureP95 ? weightAvg(pressureP95) : null,
+      }
+    })
+
+  const machineName =
+    collector.machineLabel ?? (collector.machineSerial ? `Prisma S/N ${collector.machineSerial}` : PRISMA_MACHINE_LABEL)
+
+  const eventDistribution = [...collector.eventDistribution.entries()]
+    .map(([name, value]) => ({ name, value }))
+    .sort((a, b) => b.value - a.value)
+
+  collector.sessions.sort((a, b) => (a.start ?? '').localeCompare(b.start ?? ''))
+
+  if (daily.length === 0 && collector.sessions.length === 0) {
+    collector.warnings.push(
+      'No usable Weinmann/Löwenstein prisma session data was found in the PDAT payload.'
+    )
+  }
+
+  const ahiValues = daily.map((day) => day.ahi)
+  return {
+    format: 'prisma-pdat',
+    sourceFiles: Math.max(1, collector.sourceCount),
+    daily,
+    sessions: collector.sessions,
+    machineUsage: collector.sessions.length > 0 ? [{ name: machineName, sessions: collector.sessions.length }] : [],
+    eventDistribution,
+    stats: {
+      totalDays: daily.length,
+      avgAhi: averageNumber(ahiValues),
+      avgUsageHours: averageNumber(daily.map((day) => day.usageHours)),
+      totalSessions: collector.sessions.length,
+      totalRespiratoryEvents: eventDistribution.reduce((total, event) => total + event.value, 0),
+    },
+    warnings: collector.warnings,
+  }
 }
 
 function sanitizeMachineLabel(value: string | null): string | null {
