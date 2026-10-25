@@ -20,7 +20,7 @@ function App() {
       const parsed = await parseSleepArchive(file)
       setModel(parsed)
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Could not parse uploaded ZIP archive.')
+      setError(caught instanceof Error ? caught.message : 'Could not parse uploaded file.')
     } finally {
       setIsParsing(false)
     }
@@ -32,20 +32,23 @@ function App() {
         <p className="eyebrow">Sleep View</p>
         <h1>Private sleep data insights, fully in your browser.</h1>
         <p className="hero-copy">
-          Upload OSCAR exports or raw device ZIP bundles (EDF/PDAT) to explore trends and nightly patterns. Data never leaves
-          your device.
+          Upload OSCAR exports, ZIP bundles, or standalone raw therapy EDF/PDAT files to explore trends and nightly patterns.
+          Data never leaves your device.
         </p>
-        <label className="upload-panel" htmlFor="zip-upload">
-          <span>Upload ZIP archive</span>
+        <label className="upload-panel" htmlFor="sleep-data-upload">
+          <span>Upload sleep data file</span>
           <input
-            id="zip-upload"
+            id="sleep-data-upload"
             type="file"
-            accept=".zip,.oscar"
+            accept=".zip,.oscar,.edf,.pdat,.wmedf,.webp"
             onChange={(event) => void onFileChange(event.target.files?.[0] ?? null)}
           />
-          <small>Supported: OSCAR profile backup SQL bundles, raw therapy EDF/PDAT bundles, and CSV-based ZIP exports.</small>
+          <small>
+            Supported: .zip/.oscar archives and raw therapy files (.edf/.pdat), including
+            Löwenstein/Weinmann prisma exports (ZIP-wrapped or plain WMEDF payloads).
+          </small>
         </label>
-        {isParsing && <p className="state">Parsing archive locally...</p>}
+        {isParsing && <p className="state">Parsing file locally...</p>}
         {error && <p className="error">{error}</p>}
       </section>
 
